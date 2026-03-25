@@ -283,6 +283,33 @@ def upload_blob(account_name, container_name, blob_name, file_data, subscription
         return None, "Upload timed out after 5 minutes."
 
 
+def get_apim_services(subscription_id=None, resource_group=None):
+    args = ["apim", "list"]
+    if subscription_id:
+        args += ["--subscription", subscription_id]
+    if resource_group:
+        args += ["--resource-group", resource_group]
+    data, err = run_az(*args)
+    return data or [], err
+
+def get_apim_apis(service_name, resource_group, subscription_id=None):
+    args = ["apim", "api", "list", "--service-name", service_name, "--resource-group", resource_group]
+    if subscription_id:
+        args += ["--subscription", subscription_id]
+    data, err = run_az(*args)
+    return data or [], err
+
+def get_apim_api_operations(service_name, resource_group, api_id, subscription_id=None):
+    args = ["apim", "api", "operation", "list",
+            "--service-name", service_name,
+            "--resource-group", resource_group,
+            "--api-id", api_id]
+    if subscription_id:
+        args += ["--subscription", subscription_id]
+    data, err = run_az(*args)
+    return data or [], err
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -586,6 +613,17 @@ HTML = r"""<!DOCTYPE html>
       Virtual Machines
     </div>
 
+    <div class="nav-section-label">Integration</div>
+
+    <div class="nav-item" id="nav-apim" onclick="switchView('apim')">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <circle cx="8" cy="8" r="6.3" stroke="currentColor" stroke-width="1.4"/>
+        <path d="M5 8h6M8 5v6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        <path d="M5.5 5.5C6.5 6.5 6.5 9.5 5.5 10.5M10.5 5.5C9.5 6.5 9.5 9.5 10.5 10.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+      </svg>
+      API Management
+    </div>
+
     <div class="nav-section-label">Storage</div>
 
     <div class="nav-item" id="nav-storage" onclick="switchView('storage')">
@@ -681,6 +719,21 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- APIM view -->
+      <div class="view" id="view-apim">
+        <div class="stats" id="apim-stats" style="display:none">
+          <div class="stat"><div class="val" id="apim-total">0</div><div class="lbl">Services</div></div>
+          <div class="stat"><div class="val" id="apim-rgs">0</div><div class="lbl">Resource Groups</div></div>
+          <div class="stat"><div class="val" id="apim-regions">0</div><div class="lbl">Regions</div></div>
+        </div>
+        <div id="apim-breadcrumb" class="breadcrumb" style="display:none"></div>
+        <div id="apim-content"></div>
+        <div class="empty" id="apim-empty" style="display:none">
+          <svg width="44" height="44" viewBox="0 0 44 44" fill="none"><circle cx="22" cy="22" r="17" stroke="#8892a4" stroke-width="1.8"/><path d="M14 22h16M22 14v16" stroke="#8892a4" stroke-width="1.8" stroke-linecap="round"/></svg>
+          No API Management services found.
+        </div>
+      </div>
+
     </main>
   </div>
 </div>
@@ -700,6 +753,12 @@ HTML = r"""<!DOCTYPE html>
 let currentView = 'container-apps';
 let allApps = [];
 let allVMs = [];
+let allAPIM = [];
+let apimDrilldown = 'services'; // 'services' | 'apis' | 'operations'
+let currentAPIMService = null;
+let currentAPIMApi = null;
+let lastAPIMApis = [];
+let lastAPIMOperations = [];
 let subscriptions = [];
 let allStorageAccounts      = [];
 let storageDrilldown        = 'accounts'; // 'accounts' | 'containers' | 'blobs'
@@ -726,9 +785,11 @@ function switchView(view) {
   document.getElementById('view-container-apps').classList.toggle('active', view === 'container-apps');
   document.getElementById('view-vms').classList.toggle('active', view === 'vms');
   document.getElementById('view-storage').classList.toggle('active', view === 'storage');
+  document.getElementById('view-apim').classList.toggle('active', view === 'apim');
   document.getElementById('nav-ca').classList.toggle('active', view === 'container-apps');
   document.getElementById('nav-vm').classList.toggle('active', view === 'vms');
   document.getElementById('nav-storage').classList.toggle('active', view === 'storage');
+  document.getElementById('nav-apim').classList.toggle('active', view === 'apim');
   refresh();
 }
 
@@ -866,6 +927,135 @@ async function startVM(name, rg, sub, btn) {
   }
 }
 
+// ── APIM render ──
+function apimTierBadge(sku) {
+  const t = (sku?.name || '').toLowerCase();
+  if (t === 'consumption') return '<span class="badge running">Consumption</span>';
+  if (t === 'developer')   return '<span class="badge unknown">Developer</span>';
+  if (t === 'basic')       return '<span class="badge unknown">Basic</span>';
+  if (t === 'standard')    return '<span class="badge deallocated">Standard</span>';
+  if (t === 'premium')     return '<span class="badge stopped">Premium</span>';
+  return `<span class="badge unknown">${sku?.name || '?'}</span>`;
+}
+
+function methodBadge(method) {
+  const m = (method || 'GET').toUpperCase();
+  const colors = { GET:'#1d6fa4', POST:'#276749', PUT:'#744210', DELETE:'#7f1d1d', PATCH:'#4c1d6b' };
+  const bg = colors[m] || '#2d3148';
+  return `<span style="background:${bg};color:#fff;border-radius:4px;padding:1px 7px;font-size:11px;font-weight:700;letter-spacing:.3px">${m}</span>`;
+}
+
+function renderAPIMServices(services) {
+  const content = document.getElementById('apim-content');
+  const empty   = document.getElementById('apim-empty');
+  const stats   = document.getElementById('apim-stats');
+  const bc      = document.getElementById('apim-breadcrumb');
+  bc.style.display = 'none';
+  if (!services.length) {
+    content.innerHTML = ''; empty.style.display = ''; stats.style.display = 'none'; return;
+  }
+  empty.style.display = 'none'; stats.style.display = '';
+  document.getElementById('apim-total').textContent   = allAPIM.length;
+  document.getElementById('apim-rgs').textContent     = new Set(allAPIM.map(s => s.resourceGroup)).size;
+  document.getElementById('apim-regions').textContent = new Set(allAPIM.map(s => s.location)).size;
+  content.innerHTML = `<table class="tbl">
+    <thead><tr><th>Name</th><th>Resource Group</th><th>Location</th><th>Tier</th><th>Gateway URL</th></tr></thead>
+    <tbody>${services.map(s => {
+      const sub = (s.id || '').split('/')[2] || '';
+      return `<tr style="cursor:pointer" onclick="loadAPIMApis('${enc(s.name)}','${enc(s.resourceGroup)}','${enc(sub)}')">
+        <td><strong>${s.name}</strong></td>
+        <td>${s.resourceGroup}</td>
+        <td>${s.location || '—'}</td>
+        <td>${apimTierBadge(s.sku)}</td>
+        <td style="font-size:12px;color:var(--muted)">${s.gatewayUrl || '—'}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+}
+
+function renderAPIMApis(apis) {
+  const content = document.getElementById('apim-content');
+  if (!apis.length) { content.innerHTML = '<div class="empty">No APIs found in this service.</div>'; return; }
+  content.innerHTML = `<table class="tbl">
+    <thead><tr><th>API Name</th><th>Path</th><th>Protocol(s)</th><th>Version</th><th>Description</th></tr></thead>
+    <tbody>${apis.map(a => {
+      const sub = (currentAPIMService?.id || '').split('/')[2] || '';
+      return `<tr style="cursor:pointer" onclick="loadAPIMOperations('${enc(a.name)}','${enc(a.displayName || a.name)}')">
+        <td><strong>${a.displayName || a.name}</strong></td>
+        <td style="font-family:monospace;font-size:12px">${a.path || '—'}</td>
+        <td>${(a.protocols || []).join(', ') || '—'}</td>
+        <td>${a.apiVersion || '—'}</td>
+        <td style="font-size:12px;color:var(--muted)">${a.description || ''}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+}
+
+function renderAPIMOperations(ops) {
+  const content = document.getElementById('apim-content');
+  if (!ops.length) { content.innerHTML = '<div class="empty">No operations found for this API.</div>'; return; }
+  content.innerHTML = `<table class="tbl">
+    <thead><tr><th>Method</th><th>Display Name</th><th>URL Template</th><th>Description</th></tr></thead>
+    <tbody>${ops.map(o => `<tr>
+      <td>${methodBadge(o.method)}</td>
+      <td>${o.displayName || o.name || '—'}</td>
+      <td style="font-family:monospace;font-size:12px">${o.urlTemplate || '—'}</td>
+      <td style="font-size:12px;color:var(--muted)">${o.description || ''}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+async function loadAPIMApis(eName, eRg, eSub) {
+  clearSearch();
+  apimDrilldown = 'apis';
+  currentAPIMService = { name: decodeURIComponent(eName), resourceGroup: decodeURIComponent(eRg), id: `/subscriptions/${eSub}` };
+  const bc = document.getElementById('apim-breadcrumb');
+  bc.style.display = '';
+  bc.innerHTML = `<span class="bc-link" onclick="resetAPIM()">Services</span>
+    <span class="bc-sep">›</span>
+    <span>${decodeURIComponent(eName)}</span>`;
+  document.getElementById('apim-stats').style.display = 'none';
+  document.getElementById('apim-empty').style.display = 'none';
+  document.getElementById('apim-content').innerHTML = '<div style="padding:20px;color:var(--muted)">Loading APIs…</div>';
+  const url = `/api/apim/${eName}/apis?resource_group=${eRg}&subscription=${eSub}`;
+  const data = await apiFetch(url);
+  lastAPIMApis = data.data || [];
+  renderAPIMApis(lastAPIMApis);
+  document.getElementById('status-text').textContent = `${lastAPIMApis.length} API(s)`;
+}
+
+async function loadAPIMOperations(eApiId, eApiName) {
+  clearSearch();
+  apimDrilldown = 'operations';
+  currentAPIMApi = { id: decodeURIComponent(eApiId), name: decodeURIComponent(eApiName) };
+  const svc = currentAPIMService;
+  const eSvc = enc(svc.name); const eRg = enc(svc.resourceGroup);
+  const eSub = enc((svc.id || '').split('/')[2] || '');
+  const bc = document.getElementById('apim-breadcrumb');
+  bc.innerHTML = `<span class="bc-link" onclick="resetAPIM()">Services</span>
+    <span class="bc-sep">›</span>
+    <span class="bc-link" onclick="loadAPIMApis('${eSvc}','${eRg}','${eSub}')">${svc.name}</span>
+    <span class="bc-sep">›</span>
+    <span>${decodeURIComponent(eApiName)}</span>`;
+  document.getElementById('apim-content').innerHTML = '<div style="padding:20px;color:var(--muted)">Loading operations…</div>';
+  const url = `/api/apim/${eSvc}/apis/${eApiId}/operations?resource_group=${eRg}&subscription=${eSub}`;
+  const data = await apiFetch(url);
+  lastAPIMOperations = data.data || [];
+  renderAPIMOperations(lastAPIMOperations);
+  document.getElementById('status-text').textContent = `${lastAPIMOperations.length} operation(s)`;
+}
+
+function resetAPIM() {
+  clearSearch();
+  apimDrilldown = 'services';
+  currentAPIMService = null;
+  currentAPIMApi = null;
+  lastAPIMApis = [];
+  lastAPIMOperations = [];
+  document.getElementById('apim-breadcrumb').style.display = 'none';
+  filterAndRender();
+}
+
 // ── Filters ──
 function appSubId(a) {
   // subscriptionId may be a top-level field or embedded in the resource id
@@ -930,6 +1120,32 @@ function filterAndRender() {
     renderStorageAccounts(accounts);
     document.getElementById('status-text').textContent =
       allStorageAccounts.length ? `${accounts.length} of ${allStorageAccounts.length} account(s)` : '';
+
+  } else if (currentView === 'apim') {
+    if (apimDrilldown === 'apis') {
+      const filtered = q ? lastAPIMApis.filter(a =>
+        [(a.displayName||''), (a.path||''), (a.description||'')].some(t => t.toLowerCase().includes(q)))
+        : lastAPIMApis;
+      renderAPIMApis(filtered);
+      document.getElementById('status-text').textContent = `${filtered.length} of ${lastAPIMApis.length} API(s)`;
+      return;
+    }
+    if (apimDrilldown === 'operations') {
+      const filtered = q ? lastAPIMOperations.filter(o =>
+        [(o.displayName||''), (o.urlTemplate||''), (o.method||'')].some(t => t.toLowerCase().includes(q)))
+        : lastAPIMOperations;
+      renderAPIMOperations(filtered);
+      document.getElementById('status-text').textContent = `${filtered.length} of ${lastAPIMOperations.length} operation(s)`;
+      return;
+    }
+    apimDrilldown = 'services';
+    let services = allAPIM;
+    if (sub) services = services.filter(s => (s.id || '').split('/')[2].toLowerCase() === sub);
+    if (rg)  services = services.filter(s => (s.resourceGroup || '').toLowerCase() === rg.toLowerCase());
+    if (q)   services = services.filter(s => hit(s.name, s.resourceGroup, s.location, s.sku?.name, s.gatewayUrl));
+    renderAPIMServices(services);
+    document.getElementById('status-text').textContent =
+      allAPIM.length ? `${services.length} of ${allAPIM.length} service(s)` : '';
   }
 }
 
@@ -998,6 +1214,16 @@ async function refresh() {
       if (data.error) { errEl.innerHTML = `<div class="error-box">&#9888; ${data.error}</div>`; allVMs = []; }
       else { allVMs = data.data || []; }
       filterAndRender();
+    } else if (currentView === 'apim') {
+      status.textContent = 'Fetching API Management services…';
+      apimDrilldown = 'services';
+      currentAPIMService = null; currentAPIMApi = null;
+      lastAPIMApis = []; lastAPIMOperations = [];
+      const data = await apiFetch('/api/apim' + qs);
+      if (data.error) { errEl.innerHTML = `<div class="error-box">&#9888; ${data.error}</div>`; allAPIM = []; }
+      else { allAPIM = data.data || []; }
+      filterAndRender();
+
     } else if (currentView === 'storage') {
       status.textContent = 'Fetching storage accounts…';
       storageDrilldown = 'accounts';
@@ -1909,6 +2135,27 @@ class Handler(BaseHTTPRequestHandler):
             rg  = unquote(q("resource_group") or "")
             sub = q("subscription")
             data, err = get_nsg_rules(nsg_name, rg, sub)
+            self.send_json({"error": err} if err else {"data": data})
+
+        elif path == "/api/apim":
+            data, err = get_apim_services(q("subscription"), q("resource_group"))
+            self.send_json({"error": err} if err else {"data": data})
+
+        elif path.startswith("/api/apim/") and "/apis/" in path and path.endswith("/operations"):
+            # /api/apim/{service}/apis/{api_id}/operations
+            rest     = path[len("/api/apim/"):-len("/operations")]
+            svc, api_id = rest.split("/apis/", 1)
+            svc    = unquote(svc); api_id = unquote(api_id)
+            rg     = unquote(q("resource_group") or "")
+            sub    = q("subscription")
+            data, err = get_apim_api_operations(svc, rg, api_id, sub)
+            self.send_json({"error": err} if err else {"data": data})
+
+        elif path.startswith("/api/apim/") and path.endswith("/apis"):
+            svc = unquote(path[len("/api/apim/"):-len("/apis")])
+            rg  = unquote(q("resource_group") or "")
+            sub = q("subscription")
+            data, err = get_apim_apis(svc, rg, sub)
             self.send_json({"error": err} if err else {"data": data})
 
         elif path == "/api/storage":
