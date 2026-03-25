@@ -316,6 +316,21 @@ def get_apim_api_policy(service_name, resource_group, api_id, subscription_id=No
         return {"properties": {"value": ""}}, None
     return data, err
 
+def get_apim_operation_policy(service_name, resource_group, api_id, operation_id, subscription_id=None):
+    sub = subscription_id or ""
+    url = (
+        f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.ApiManagement/service/{service_name}"
+        f"/apis/{api_id}/operations/{operation_id}/policies/policy?api-version=2022-08-01"
+    )
+    args = ["rest", "--method", "GET", "--url", url]
+    if subscription_id:
+        args += ["--subscription", subscription_id]
+    data, err = run_az(*args)
+    if err and ("ResourceNotFound" in err or "Not Found" in err):
+        return {"properties": {"value": ""}}, None
+    return data, err
+
 def get_apim_api_operations(service_name, resource_group, api_id, subscription_id=None):
     args = ["apim", "api", "operation", "list",
             "--service-name", service_name,
@@ -1033,6 +1048,24 @@ async function showAPIMPolicy(eSvc, eRg, eApiId, eApiName, eSub) {
                 white-space:pre-wrap;word-break:break-all">${highlightXml(pretty)}</pre>`;
 }
 
+async function showAPIMOperationPolicy(eSvc, eRg, eApiId, eOpId, eOpName, eSub) {
+  openModal(`Policy — ${decodeURIComponent(eOpName)}`);
+  const url = `/api/apim/${eSvc}/apis/${eApiId}/operations/${eOpId}/policy?resource_group=${eRg}&subscription=${eSub}`;
+  const data = await apiFetch(url);
+  const body = document.getElementById('modal-body');
+  if (data.error) { body.innerHTML = `<div class="error-box">&#9888; ${data.error}</div>`; return; }
+  const xml = data.data?.properties?.value || data.data?.value || '';
+  if (!xml) { body.innerHTML = '<div style="color:var(--muted);padding:10px">No policy defined for this operation.</div>'; return; }
+  const pretty = formatXml(xml);
+  body.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+      <button onclick="copyToClipboard(this,'${encodeURIComponent(xml)}')" style="font-size:12px;padding:4px 10px">&#128203; Copy</button>
+    </div>
+    <pre style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+                padding:14px;overflow:auto;font-size:12px;line-height:1.6;color:var(--text);
+                white-space:pre-wrap;word-break:break-all">${highlightXml(pretty)}</pre>`;
+}
+
 function formatXml(xml) {
   // Basic XML pretty-printer
   let indent = 0;
@@ -1071,13 +1104,21 @@ function copyToClipboard(btn, encoded) {
 function renderAPIMOperations(ops) {
   const content = document.getElementById('apim-content');
   if (!ops.length) { content.innerHTML = '<div class="empty">No operations found for this API.</div>'; return; }
+  const svc  = currentAPIMService;
+  const api  = currentAPIMApi;
+  const eSvc = enc(svc?.name || '');
+  const eRg  = enc(svc?.resourceGroup || '');
+  const eSub = enc((svc?.id || '').split('/')[2] || '');
+  const eApi = enc(api?.id || '');
   content.innerHTML = `<table class="tbl">
-    <thead><tr><th>Method</th><th>Display Name</th><th>URL Template</th><th>Description</th></tr></thead>
+    <thead><tr><th>Method</th><th>Display Name</th><th>URL Template</th><th>Description</th><th></th></tr></thead>
     <tbody>${ops.map(o => `<tr>
       <td>${methodBadge(o.method)}</td>
       <td>${o.displayName || o.name || '—'}</td>
       <td style="font-family:monospace;font-size:12px">${o.urlTemplate || '—'}</td>
       <td style="font-size:12px;color:var(--muted)">${o.description || ''}</td>
+      <td><button onclick="showAPIMOperationPolicy('${eSvc}','${eRg}','${eApi}','${enc(o.name)}','${enc(o.displayName||o.name)}','${eSub}')"
+            style="font-size:11px;padding:3px 9px">&#128196; Policy</button></td>
     </tr>`).join('')}</tbody>
   </table>`;
 }
@@ -2216,6 +2257,17 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/apim":
             data, err = get_apim_services(q("subscription"), q("resource_group"))
+            self.send_json({"error": err} if err else {"data": data})
+
+        elif path.startswith("/api/apim/") and "/apis/" in path and "/operations/" in path and path.endswith("/policy"):
+            # /api/apim/{service}/apis/{api_id}/operations/{op_id}/policy
+            rest = path[len("/api/apim/"):-len("/policy")]
+            svc_rest, op_rest = rest.split("/apis/", 1)
+            api_id, operation_id = op_rest.split("/operations/", 1)
+            svc = unquote(svc_rest); api_id = unquote(api_id); operation_id = unquote(operation_id)
+            rg  = unquote(q("resource_group") or "")
+            sub = q("subscription")
+            data, err = get_apim_operation_policy(svc, rg, api_id, operation_id, sub)
             self.send_json({"error": err} if err else {"data": data})
 
         elif path.startswith("/api/apim/") and "/apis/" in path and path.endswith("/policy"):
