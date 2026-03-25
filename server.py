@@ -305,7 +305,7 @@ def get_apim_api_policy(service_name, resource_group, api_id, subscription_id=No
     url = (
         f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{resource_group}"
         f"/providers/Microsoft.ApiManagement/service/{service_name}"
-        f"/apis/{api_id}/policies/policy?api-version=2022-08-01&format=rawxml"
+        f"/apis/{api_id}/policies/policy?api-version=2022-08-01"
     )
     args = ["rest", "--method", "GET", "--url", url]
     if subscription_id:
