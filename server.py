@@ -311,6 +311,9 @@ def get_apim_api_policy(service_name, resource_group, api_id, subscription_id=No
     if subscription_id:
         args += ["--subscription", subscription_id]
     data, err = run_az(*args)
+    # A 404 / ResourceNotFound simply means no policy is defined — not a real error
+    if err and ("ResourceNotFound" in err or "PoliciesConfiguration not found" in err or "Not Found" in err):
+        return {"properties": {"value": ""}}, None
     return data, err
 
 def get_apim_api_operations(service_name, resource_group, api_id, subscription_id=None):
