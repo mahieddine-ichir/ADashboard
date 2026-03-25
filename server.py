@@ -61,6 +61,27 @@ def get_container_app_replicas(name, resource_group, subscription_id=None):
     data, err = run_az(*args)
     return data or [], err
 
+def create_revision(name, resource_group, image, cpu=None, memory=None,
+                    min_replicas=None, max_replicas=None, revision_suffix=None,
+                    env_vars=None, subscription_id=None):
+    args = ["containerapp", "update", "--name", name, "--resource-group", resource_group,
+            "--image", image]
+    if cpu:
+        args += ["--cpu", str(cpu)]
+    if memory:
+        args += ["--memory", str(memory)]
+    if min_replicas is not None:
+        args += ["--min-replicas", str(min_replicas)]
+    if max_replicas is not None:
+        args += ["--max-replicas", str(max_replicas)]
+    if revision_suffix:
+        args += ["--revision-suffix", revision_suffix]
+    if env_vars:  # list of "KEY=VALUE" strings
+        args += ["--set-env-vars"] + env_vars
+    if subscription_id:
+        args += ["--subscription", subscription_id]
+    return run_az(*args)
+
 def get_vms(subscription_id=None, resource_group=None):
     args = ["vm", "list", "--show-details"]
     if subscription_id:
@@ -72,6 +93,12 @@ def get_vms(subscription_id=None, resource_group=None):
 
 def get_vm_detail(name, resource_group, subscription_id=None):
     args = ["vm", "show", "-d", "--name", name, "--resource-group", resource_group]
+    if subscription_id:
+        args += ["--subscription", subscription_id]
+    return run_az(*args)
+
+def start_vm(name, resource_group, subscription_id=None):
+    args = ["vm", "start", "--name", name, "--resource-group", resource_group]
     if subscription_id:
         args += ["--subscription", subscription_id]
     return run_az(*args)
@@ -339,6 +366,20 @@ HTML = r"""<!DOCTYPE html>
   }
   .nav-powered-badge:hover { opacity: 1; }
   .nav-powered-badge span { font-size: 12px; font-weight: 600; letter-spacing: -.1px; }
+
+  /* ── New Revision form ── */
+  .revision-form { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-top: 4px; }
+  .revision-form h4 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--text); }
+  .rev-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .rev-field { display: flex; flex-direction: column; gap: 4px; }
+  .rev-field.full { grid-column: 1 / -1; }
+  .rev-field label { font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .rev-field input { background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius); padding: 6px 10px; font-size: 13px; font-family: inherit; }
+  .rev-field input:focus { outline: none; border-color: var(--blue-light); }
+  .rev-actions { display: flex; gap: 8px; }
+  .rev-feedback { margin-top: 10px; font-size: 13px; }
+  .rev-feedback.ok  { color: var(--green); }
+  .rev-feedback.err { color: var(--red); }
 
   /* ── Content area ── */
   .content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -669,9 +710,13 @@ let lastBlobsData           = [];     // cache for search re-filter
 let currentSAContainerSub   = '';     // eSub when containers were loaded
 let currentSAContainerECont = '';     // eContainer when blobs were loaded
 
-async function apiFetch(path) {
-  const res = await fetch(path);
-  return res.json();
+async function apiFetch(path, options) {
+  try {
+    const res = await fetch(path, options);
+    return res.json();
+  } catch (e) {
+    return { error: e.message };
+  }
 }
 
 // ── View switching ──
@@ -779,6 +824,14 @@ function renderVMs(vms) {
     const loc  = vm.location || '—';
     const sub  = vm.id?.split('/')[2] || '';
     const pip  = vm.publicIps || '—';
+    const ps   = (vm.powerState || '').toLowerCase();
+    const canStart = ps.includes('deallocated') || ps.includes('stopped');
+    const startBtn = canStart
+      ? `<button class="primary" style="font-size:12px;padding:4px 10px;margin-top:8px"
+           onclick="event.stopPropagation();startVM('${enc(vm.name)}','${enc(rg)}','${enc(sub)}',this)">
+           &#9654; Start
+         </button>`
+      : '';
     return `
       <div class="card" onclick="showVMDetail('${enc(vm.name)}','${enc(rg)}','${enc(sub)}')">
         <div class="card-header">
@@ -791,8 +844,26 @@ function renderVMs(vms) {
           <div class="meta-item"><div class="k">Size</div><div class="v">${size}</div></div>
           <div class="meta-item"><div class="k">Public IP</div><div class="v">${pip}</div></div>
         </div>
+        ${startBtn}
       </div>`;
   }).join('');
+}
+
+async function startVM(name, rg, sub, btn) {
+  btn.disabled = true;
+  btn.textContent = '⏳ Starting…';
+  const qs = `?resource_group=${enc(decodeURIComponent(rg))}&subscription=${enc(sub)}`;
+  try {
+    const res = await apiFetch(`/api/vms/${name}/start${qs}`, { method: 'POST' });
+    if (res.error) { btn.textContent = '✖ ' + res.error; btn.disabled = false; return; }
+    btn.textContent = '✔ Started';
+    btn.style.background = '#1a6e3c';
+    // refresh VM list after a short delay so the new state is visible
+    setTimeout(() => loadVMs(), 3000);
+  } catch(e) {
+    btn.textContent = '✖ Failed';
+    btn.disabled = false;
+  }
 }
 
 // ── Filters ──
@@ -1006,7 +1077,105 @@ async function showCADetail(eName, eRg, eSub) {
       `</div></div>`;
   }
 
+  // Pre-fill values from current template for the revision form
+  const curImage  = containers[0]?.image  || '';
+  const curCpu    = containers[0]?.resources?.cpu    ?? '';
+  const curMem    = containers[0]?.resources?.memory ?? '';
+  const curMin    = scale?.minReplicas ?? '';
+  const curMax    = scale?.maxReplicas ?? '';
+
+  html += `<div class="detail-section">
+    <h3>New Revision</h3>
+    <div id="rev-form-wrap">
+      <button class="primary" onclick="showRevisionForm()">+ Deploy New Revision</button>
+    </div>
+    <div class="revision-form" id="rev-form" style="display:none">
+      <h4>Deploy a new revision</h4>
+      <div class="rev-fields">
+        <div class="rev-field full">
+          <label>Image</label>
+          <input id="rev-image" type="text" value="${htmlEsc(curImage)}" placeholder="e.g. myrepo/myimage:tag"/>
+        </div>
+        <div class="rev-field full">
+          <label>Revision suffix <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional — result: ${decodeURIComponent(eName)}--&lt;suffix&gt;)</span></label>
+          <input id="rev-suffix" type="text" placeholder="e.g. v2 or 20240325" pattern="[a-z0-9-]+" title="Lowercase letters, numbers, and hyphens only"/>
+        </div>
+        <div class="rev-field">
+          <label>CPU (cores)</label>
+          <input id="rev-cpu" type="text" value="${curCpu}" placeholder="e.g. 0.5"/>
+        </div>
+        <div class="rev-field">
+          <label>Memory</label>
+          <input id="rev-mem" type="text" value="${curMem}" placeholder="e.g. 1Gi"/>
+        </div>
+        <div class="rev-field">
+          <label>Min Replicas</label>
+          <input id="rev-min" type="number" min="0" value="${curMin}" placeholder="0"/>
+        </div>
+        <div class="rev-field">
+          <label>Max Replicas</label>
+          <input id="rev-max" type="number" min="1" value="${curMax}" placeholder="1"/>
+        </div>
+      </div>
+      <div class="rev-actions">
+        <button class="primary" onclick="submitRevision('${eName}','${enc(decodeURIComponent(eRg))}','${enc(decodeURIComponent(eSub))}')">Deploy</button>
+        <button onclick="hideRevisionForm()">Cancel</button>
+      </div>
+    </div>
+    <div class="rev-feedback" id="rev-feedback"></div>
+  </div>`;
+
   document.getElementById('modal-body').innerHTML = html;
+}
+
+function showRevisionForm() {
+  document.getElementById('rev-form').style.display = '';
+  document.getElementById('rev-form-wrap').querySelector('button').style.display = 'none';
+}
+function hideRevisionForm() {
+  document.getElementById('rev-form').style.display = 'none';
+  document.getElementById('rev-form-wrap').querySelector('button').style.display = '';
+  setRevFeedback('', null);
+}
+
+async function submitRevision(eName, eRg, eSub) {
+  const image = document.getElementById('rev-image').value.trim();
+  if (!image) { setRevFeedback('Image is required.', false); return; }
+
+  const payload = { image };
+  const suffix = document.getElementById('rev-suffix').value.trim();
+  const cpu = document.getElementById('rev-cpu').value.trim();
+  const mem = document.getElementById('rev-mem').value.trim();
+  const min = document.getElementById('rev-min').value.trim();
+  const max = document.getElementById('rev-max').value.trim();
+  if (suffix) payload.revision_suffix = suffix;
+  if (cpu) payload.cpu = cpu;
+  if (mem) payload.memory = mem;
+  if (min !== '') payload.min_replicas = parseInt(min);
+  if (max !== '') payload.max_replicas = parseInt(max);
+
+  setRevFeedback('Deploying…', null);
+  document.querySelectorAll('.rev-actions button').forEach(b => b.disabled = true);
+
+  let url = `/api/container-apps/${eName}/revisions?resource_group=${eRg}`;
+  if (eSub) url += `&subscription=${eSub}`;
+  const res = await apiFetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+
+  document.querySelectorAll('.rev-actions button').forEach(b => b.disabled = false);
+  if (res.error) {
+    setRevFeedback('Error: ' + res.error, false);
+  } else {
+    // Collapse form, show success message (feedback is outside the form, stays visible)
+    document.getElementById('rev-form').style.display = 'none';
+    document.getElementById('rev-form-wrap').querySelector('button').style.display = '';
+    setRevFeedback('Revision deployed successfully!', true);
+  }
+}
+function setRevFeedback(msg, ok) {
+  const el = document.getElementById('rev-feedback');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'rev-feedback' + (ok === true ? ' ok' : ok === false ? ' err' : '');
 }
 
 // ── VM detail ──
@@ -1618,6 +1787,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal()
 
 // ── HTML helpers ──
 function enc(s) { return encodeURIComponent(s || ''); }
+function htmlEsc(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function kv(pairs) {
   return '<div class="detail-grid">' +
     pairs.map(([k, v]) => `<span class="k">${k}</span><span class="v">${v}</span>`).join('') +
@@ -1788,7 +1958,38 @@ class Handler(BaseHTTPRequestHandler):
         def q(key):
             return qs.get(key, [None])[0]
 
-        if path.startswith("/api/nsg/") and path.endswith("/rules"):
+        if path.startswith("/api/container-apps/") and path.endswith("/revisions"):
+            name = unquote(path[len("/api/container-apps/"):-len("/revisions")])
+            rg   = unquote(q("resource_group") or "")
+            sub  = q("subscription")
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                self.send_json({"error": "Invalid JSON body"}, 400); return
+            image = (payload.get("image") or "").strip()
+            if not image:
+                self.send_json({"error": "image is required"}, 400); return
+            data, err = create_revision(
+                name, rg, image,
+                cpu=payload.get("cpu"),
+                memory=payload.get("memory"),
+                min_replicas=payload.get("min_replicas"),
+                max_replicas=payload.get("max_replicas"),
+                revision_suffix=payload.get("revision_suffix"),
+                subscription_id=sub,
+            )
+            self.send_json({"error": err} if err else {"data": data})
+
+        elif path.startswith("/api/vms/") and path.endswith("/start"):
+            name = unquote(path[len("/api/vms/"):-len("/start")])
+            rg   = unquote(q("resource_group") or "")
+            sub  = q("subscription")
+            _, err = start_vm(name, rg, sub)
+            self.send_json({"error": err} if err else {"ok": True})
+
+        elif path.startswith("/api/nsg/") and path.endswith("/rules"):
             nsg_name = unquote(path[len("/api/nsg/"):-len("/rules")])
             rg  = unquote(q("resource_group") or "")
             sub = q("subscription")
