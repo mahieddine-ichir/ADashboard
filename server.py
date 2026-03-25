@@ -19,7 +19,8 @@ def run_az(*args):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             return None, result.stderr.strip()
-        return json.loads(result.stdout), None
+        out = result.stdout.strip()
+        return json.loads(out) if out else {}, None
     except FileNotFoundError:
         return None, "Azure CLI (az) not found. Install it from https://aka.ms/installazurecli"
     except subprocess.TimeoutExpired:
