@@ -300,10 +300,14 @@ def get_apim_apis(service_name, resource_group, subscription_id=None):
     return data or [], err
 
 def get_apim_api_policy(service_name, resource_group, api_id, subscription_id=None):
-    args = ["apim", "api", "policy", "show",
-            "--service-name", service_name,
-            "--resource-group", resource_group,
-            "--api-id", api_id]
+    # az apim api policy is not a CLI command — use az rest against the ARM REST API instead
+    sub = subscription_id or ""
+    url = (
+        f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.ApiManagement/service/{service_name}"
+        f"/apis/{api_id}/policies/policy?api-version=2022-08-01&format=rawxml"
+    )
+    args = ["rest", "--method", "GET", "--url", url]
     if subscription_id:
         args += ["--subscription", subscription_id]
     data, err = run_az(*args)
