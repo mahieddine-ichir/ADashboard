@@ -308,10 +308,12 @@ def get_apim_api_policy(service_name, resource_group, api_id, subscription_id=No
         f"/providers/Microsoft.ApiManagement/service/{service_name}"
         f"/apis/{api_id}/policies/policy?api-version=2022-08-01"
     )
+    print(f"[APIM policy] GET {url}", flush=True)
     args = ["rest", "--method", "GET", "--url", url]
     if subscription_id:
         args += ["--subscription", subscription_id]
     data, err = run_az(*args)
+    print(f"[APIM policy] err={err!r}  keys={list(data.keys()) if isinstance(data, dict) else data}", flush=True)
     # A 404 / ResourceNotFound simply means no policy is defined — not a real error
     if err and ("ResourceNotFound" in err or "PoliciesConfiguration not found" in err or "Not Found" in err):
         return {"properties": {"value": ""}}, None
@@ -805,7 +807,14 @@ let currentSAContainerECont = '';     // eContainer when blobs were loaded
 async function apiFetch(path, options) {
   try {
     const res = await fetch(path, options);
-    return res.json();
+    const text = await res.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      // Server sent a non-JSON body (e.g. Python 500 HTML page) — surface it as an error
+      return { error: `Server error ${res.status}: ${text.slice(0, 300)}` };
+    }
   } catch (e) {
     return { error: e.message };
   }
@@ -1027,44 +1036,67 @@ function renderAPIMApis(apis) {
   </table>`;
 }
 
-async function showAPIMPolicy(eSvc, eRg, eApiId, eApiName, eSub) {
-  openModal(`Policy — ${decodeURIComponent(eApiName)}`);
-  const url = `/api/apim/${eSvc}/apis/${eApiId}/policy?resource_group=${eRg}&subscription=${eSub}`;
-  const data = await apiFetch(url);
-  const body = document.getElementById('modal-body');
-  if (data.error) {
-    body.innerHTML = `<div class="error-box">&#9888; ${data.error}</div>`; return;
+// Module-level store so copy/download handlers never need XML in onclick attributes
+let _policyXml = '';
+
+function _renderPolicyXml(body, xml, label) {
+  _policyXml = xml;
+  if (!xml) {
+    body.innerHTML = `<div style="color:var(--muted);padding:10px">No policy defined for this ${label}.</div>`;
+    return;
   }
-  // Azure returns the XML in the "value" field
-  const xml = data.data?.value || data.data?.properties?.value || '';
-  if (!xml) { body.innerHTML = '<div style="color:var(--muted);padding:10px">No policy defined for this API.</div>'; return; }
-  // Pretty-print and escape XML for display
   const pretty = formatXml(xml);
   body.innerHTML = `
-    <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
-      <button onclick="copyToClipboard(this,'${encodeURIComponent(xml)}')" style="font-size:12px;padding:4px 10px">&#128203; Copy</button>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:8px">
+      <button id="policy-copy-btn" style="font-size:12px;padding:4px 10px">&#128203; Copy</button>
+      <button id="policy-dl-btn"   style="font-size:12px;padding:4px 10px">&#8681; Download .xml</button>
     </div>
     <pre style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
                 padding:14px;overflow:auto;font-size:12px;line-height:1.6;color:var(--text);
                 white-space:pre-wrap;word-break:break-all">${highlightXml(pretty)}</pre>`;
+  document.getElementById('policy-copy-btn').addEventListener('click', function() {
+    navigator.clipboard.writeText(_policyXml).then(() => {
+      this.textContent = '✔ Copied!';
+      setTimeout(() => this.innerHTML = '&#128203; Copy', 2000);
+    }).catch(e => { this.textContent = '✖ ' + e.message; });
+  });
+  document.getElementById('policy-dl-btn').addEventListener('click', function() {
+    const blob = new Blob([_policyXml], { type: 'application/xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'policy.xml';
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  });
+}
+
+async function showAPIMPolicy(eSvc, eRg, eApiId, eApiName, eSub) {
+  openModal(`Policy — ${decodeURIComponent(eApiName)}`);
+  const body = document.getElementById('modal-body');
+  try {
+    const url = `/api/apim/${eSvc}/apis/${eApiId}/policy?resource_group=${eRg}&subscription=${eSub}`;
+    const data = await apiFetch(url);
+    if (data.error) { body.innerHTML = `<div class="error-box">&#9888; ${htmlEsc(data.error)}</div>`; return; }
+    const xml = data.data?.properties?.value || data.data?.value || '';
+    _renderPolicyXml(body, xml, 'API');
+  } catch(e) {
+    body.innerHTML = `<div class="error-box">&#9888; ${htmlEsc(e.message)}</div>`;
+  }
 }
 
 async function showAPIMOperationPolicy(eSvc, eRg, eApiId, eOpId, eOpName, eSub) {
   openModal(`Policy — ${decodeURIComponent(eOpName)}`);
-  const url = `/api/apim/${eSvc}/apis/${eApiId}/operations/${eOpId}/policy?resource_group=${eRg}&subscription=${eSub}`;
-  const data = await apiFetch(url);
   const body = document.getElementById('modal-body');
-  if (data.error) { body.innerHTML = `<div class="error-box">&#9888; ${data.error}</div>`; return; }
-  const xml = data.data?.properties?.value || data.data?.value || '';
-  if (!xml) { body.innerHTML = '<div style="color:var(--muted);padding:10px">No policy defined for this operation.</div>'; return; }
-  const pretty = formatXml(xml);
-  body.innerHTML = `
-    <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
-      <button onclick="copyToClipboard(this,'${encodeURIComponent(xml)}')" style="font-size:12px;padding:4px 10px">&#128203; Copy</button>
-    </div>
-    <pre style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
-                padding:14px;overflow:auto;font-size:12px;line-height:1.6;color:var(--text);
-                white-space:pre-wrap;word-break:break-all">${highlightXml(pretty)}</pre>`;
+  try {
+    const url = `/api/apim/${eSvc}/apis/${eApiId}/operations/${eOpId}/policy?resource_group=${eRg}&subscription=${eSub}`;
+    const data = await apiFetch(url);
+    if (data.error) { body.innerHTML = `<div class="error-box">&#9888; ${htmlEsc(data.error)}</div>`; return; }
+    const xml = data.data?.properties?.value || data.data?.value || '';
+    _renderPolicyXml(body, xml, 'operation');
+  } catch(e) {
+    body.innerHTML = `<div class="error-box">&#9888; ${htmlEsc(e.message)}</div>`;
+  }
 }
 
 function formatXml(xml) {
@@ -1095,12 +1127,6 @@ function highlightXml(xml) {
     .replace(/(&gt;)/g, '<span style="color:#2ea8ff">$1</span>');
 }
 
-function copyToClipboard(btn, encoded) {
-  navigator.clipboard.writeText(decodeURIComponent(encoded)).then(() => {
-    btn.textContent = '✔ Copied!';
-    setTimeout(() => btn.innerHTML = '&#128203; Copy', 2000);
-  });
-}
 
 function renderAPIMOperations(ops) {
   const content = document.getElementById('apim-content');
